@@ -74,7 +74,8 @@ static int perform_get_test(int sockfd) {
 static int connect_to_server(const char *addr, const char *port, int timeout_sec) {
     struct addrinfo hints;
     struct addrinfo *result, *rp;
-    int sockfd, err;
+    int err;
+    socklen_t err_len = sizeof(err);
 
     memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family = AF_UNSPEC;
@@ -94,26 +95,71 @@ static int connect_to_server(const char *addr, const char *port, int timeout_sec
     }
 
     for (rp = result; rp != NULL; rp = rp->ai_next) {
-        sockfd = socket(rp->ai_family, rp->ai_socktype,
+        int sockfd = socket(rp->ai_family, rp->ai_socktype,
                         rp->ai_protocol);
-        if (sockfd < 0)
+        if (sockfd < 0) {
             continue;
-
-        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(struct timeval));
-
-        err = connect(sockfd, rp->ai_addr, rp->ai_addrlen);        
-        if (err != 0) {
-            close(sockfd);
-            continue;
-        } else {
-            freeaddrinfo(result);
-            return sockfd;
         }
+
+        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout,
+                       sizeof(struct timeval)) != 0) {
+            goto cont_socket;
+        }
+
+        fd_set rset, wset;
+        FD_ZERO(&rset);
+        FD_SET(sockfd, &rset);
+        wset = rset;
+
+        int flags = 0;
+        if ((flags = fcntl(sockfd, F_GETFL, 0)) < 0) {
+            goto cont_socket;
+        }
+
+        if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            goto cont_socket;
+        }
+
+        if ((err = connect(sockfd, rp->ai_addr, rp->ai_addrlen)) != 0) {
+            if (errno != EINPROGRESS) {
+                goto cont_socket;
+            }
+        }
+        
+        if (err == 0) {
+            goto done;
+        }
+
+        if ((err = select(sockfd + 1, &rset, &wset, NULL, &timeout)) < 0) {
+            goto cont_socket;
+        }
+        if (err == 0) {
+            goto err;
+        }
+
+        if (FD_ISSET(sockfd, &rset) || FD_ISSET(sockfd, &wset)) {
+            if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &err, &err_len) < 0)
+                goto cont_socket;
+        } else {
+            goto cont_socket;
+        }
+
+        if (fcntl(sockfd, F_SETFL, flags) < 0) {
+            close(sockfd);
+            goto cont_socket;
+        }
+
+    done:
+        freeaddrinfo(result);
+        return sockfd;
+
+    cont_socket:
+        close(sockfd);
     }
 
+err:
     fprintf(stderr, "Could not create a socket\n");
     freeaddrinfo(result);
-
     return -1;
 }
 
